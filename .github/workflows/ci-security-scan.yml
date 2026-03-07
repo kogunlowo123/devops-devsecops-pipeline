@@ -1,0 +1,385 @@
+name: Enterprise DevSecOps CI Pipeline
+# Architect: Kehinde (Kenny) Samson Ogunlowo
+# Implements HIPAA, CMMC L2, and NIST 800-53 security controls
+
+on:
+  push:
+    branches: [main, develop, release/*]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 2 * * *'  # Nightly full scan
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  TRIVY_SEVERITY: HIGH,CRITICAL
+  OPA_VERSION: "0.58.0"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: write
+  id-token: write  # For OIDC-based cloud auth (no long-lived secrets)
+
+jobs:
+  # ─────────────────────────────────────────────
+  # STAGE 1: Secret Detection (fail-fast)
+  # ─────────────────────────────────────────────
+  secret-detection:
+    name: "🔑 Secret & Credential Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for Gitleaks
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          extra_args: --debug --only-verified
+
+  # ─────────────────────────────────────────────
+  # STAGE 2: Static Application Security Testing
+  # ─────────────────────────────────────────────
+  sast:
+    name: "🔍 SAST - Static Code Analysis"
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install semgrep bandit safety pylint --break-system-packages || pip install semgrep bandit safety pylint
+
+      - name: Run Semgrep SAST
+        run: |
+          semgrep --config=auto \
+            --config=p/owasp-top-ten \
+            --config=p/python \
+            --config=p/terraform \
+            --sarif \
+            --output=semgrep-results.sarif \
+            --severity=WARNING \
+            .
+        continue-on-error: false
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      - name: Run Bandit (Python Security)
+        run: |
+          bandit -r src/ -f json -o bandit-report.json -ll || true
+          python -c "
+          import json, sys
+          with open('bandit-report.json') as f:
+              data = json.load(f)
+          high_sev = [i for i in data.get('results', []) if i['issue_severity'] == 'HIGH']
+          if high_sev:
+              print(f'FAIL: {len(high_sev)} HIGH severity issues found')
+              for i in high_sev:
+                  print(f'  - {i[\"filename\"]}:{i[\"line_number\"]} - {i[\"issue_text\"]}')
+              sys.exit(1)
+          print(f'PASS: No HIGH severity issues found')
+          "
+
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: |
+            semgrep-results.sarif
+            bandit-report.json
+
+  # ─────────────────────────────────────────────
+  # STAGE 3: Software Composition Analysis (SCA)
+  # ─────────────────────────────────────────────
+  sca-dependency-scan:
+    name: "📦 SCA - Dependency Vulnerability Scan"
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'devsecops-pipeline'
+          path: '.'
+          format: 'ALL'
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+            --suppression suppression.xml
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      - name: Attest SBOM (EO 14028 Compliance)
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: '${{ github.workspace }}'
+          sbom-path: sbom.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+  # ─────────────────────────────────────────────
+  # STAGE 4: Infrastructure as Code Scanning
+  # ─────────────────────────────────────────────
+  iac-security-scan:
+    name: "🏗️ IaC Security Scan"
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov (IaC SAST)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: false
+          check: CKV_AWS_*,CKV_AZURE_*
+          skip_check: CKV_AWS_144  # Cross-region replication (handled separately)
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+          format: sarif
+          sarif_file: tfsec-results.sarif
+
+      - name: Upload IaC SARIF reports
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+  # ─────────────────────────────────────────────
+  # STAGE 5: Build & Container Hardening
+  # ─────────────────────────────────────────────
+  build-and-harden:
+    name: "🐳 Build & Harden Container"
+    runs-on: ubuntu-latest
+    needs: [sast, sca-dependency-scan, iac-security-scan]
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build image (no push yet)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.hardened
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          load: true
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: '1'
+          ignore-unfixed: false
+
+      - name: Run Grype vulnerability scan
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          fail-build: true
+          severity-cutoff: high
+
+      - name: CIS Docker Benchmark check
+        run: |
+          docker run --rm --net host --pid host --userns host --cap-add audit_control \
+            -e DOCKER_CONTENT_TRUST=$DOCKER_CONTENT_TRUST \
+            -v /etc:/etc:ro \
+            -v /usr/bin/containerd:/usr/bin/containerd:ro \
+            -v /usr/bin/runc:/usr/bin/runc:ro \
+            -v /usr/lib/systemd:/usr/lib/systemd:ro \
+            -v /var/lib:/var/lib:ro \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            --label docker_bench_security \
+            docker/docker-bench-security 2>&1 | tee cis-docker-benchmark.txt || true
+
+      - name: Push hardened image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.hardened
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+
+      - name: Sign image with Cosign
+        uses: sigstore/cosign-installer@v3
+        
+      - name: Cosign image signing
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+  # ─────────────────────────────────────────────
+  # STAGE 6: Dynamic Application Security (DAST)
+  # ─────────────────────────────────────────────
+  dast:
+    name: "🕷️ DAST - Dynamic Security Testing"
+    runs-on: ubuntu-latest
+    needs: build-and-harden
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start application for DAST
+        run: |
+          docker-compose -f docker/docker-compose.yml up -d
+          sleep 30
+          curl -f http://localhost:8080/health || exit 1
+
+      - name: OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.9.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -j -l WARN'
+          fail_action: true
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
+
+  # ─────────────────────────────────────────────
+  # STAGE 7: OPA Policy Compliance Gate
+  # ─────────────────────────────────────────────
+  policy-compliance-gate:
+    name: "⚖️ OPA Policy Compliance Gate"
+    runs-on: ubuntu-latest
+    needs: [build-and-harden, dast]
+    if: always() && needs.build-and-harden.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/v${{ env.OPA_VERSION }}/opa_linux_amd64_static
+          chmod +x opa && sudo mv opa /usr/local/bin/
+
+      - name: Download all security artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Run OPA compliance evaluation
+        run: |
+          python scripts/compliance-gate.py \
+            --sbom sbom/sbom.json \
+            --trivy-report trivy-image-results.sarif \
+            --semgrep-report sast-reports/semgrep-results.sarif \
+            --policy policies/opa-policies/
+          
+      - name: Generate compliance report
+        run: |
+          opa eval \
+            --data policies/opa-policies/hipaa.rego \
+            --data policies/opa-policies/cmmc.rego \
+            --input compliance-evidence.json \
+            --format pretty \
+            "data.compliance.allow" | tee compliance-gate-result.txt
+          
+          if grep -q "false" compliance-gate-result.txt; then
+            echo "COMPLIANCE GATE FAILED - Review violations before deployment"
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────
+  # STAGE 8: Notify & Report
+  # ─────────────────────────────────────────────
+  notify-and-report:
+    name: "📊 Security Report & Notifications"
+    runs-on: ubuntu-latest
+    needs: [policy-compliance-gate]
+    if: always()
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          text: |
+            DevSecOps Pipeline: ${{ job.status }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Create GitHub Security Advisory (if critical findings)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.securityAdvisories.createRepositoryAdvisory({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              summary: 'Critical security finding in CI pipeline',
+              description: 'Pipeline security scan detected critical vulnerabilities. Review artifacts.',
+              severity: 'critical'
+            })

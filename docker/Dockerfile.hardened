@@ -1,0 +1,64 @@
+# CIS Docker Benchmark Hardened Base Image
+# Architect: Kehinde (Kenny) Samson Ogunlowo
+# Implements CIS Docker Benchmark v1.6 + STIG controls
+
+FROM python:3.11-slim-bookworm AS base
+
+# ── CIS 4.1: Create non-root user ────────────────────────────────
+RUN groupadd -r -g 10001 appgroup && \
+    useradd -r -u 10001 -g appgroup -s /sbin/nologin -d /app appuser
+
+# ── CIS 4.9: Remove unnecessary packages ─────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# ── CIS 4.6: Add HEALTHCHECK ─────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+WORKDIR /app
+
+# ── Dependency installation (as root, before USER switch) ─────────
+COPY --chown=appuser:appgroup requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip check  # Verify no dependency conflicts
+
+# ── Copy application code ─────────────────────────────────────────
+COPY --chown=appuser:appgroup src/ ./src/
+
+# ── CIS 4.1: Switch to non-root user ────────────────────────────
+USER appuser
+
+# ── Set secure environment ────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONFAULTHANDLER=1 \
+    PIP_NO_CACHE_DIR=1
+
+# ── CIS 4.5: Expose only required ports ──────────────────────────
+EXPOSE 8080
+
+# ── Read-only filesystem (enforced at runtime via docker run --read-only)
+# ── No new privileges (enforced at runtime via --security-opt=no-new-privileges)
+
+ENTRYPOINT ["python", "-m", "src.main"]
+
+# ── Build metadata / SBOM labels (OCI spec) ──────────────────────
+ARG BUILD_DATE
+ARG GIT_COMMIT
+ARG VERSION
+
+LABEL org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.vendor="Citadel Cloud Management" \
+      org.opencontainers.image.authors="Kehinde Samson Ogunlowo <kenny@citadelcloudmanagement.com>" \
+      org.opencontainers.image.title="Enterprise DevSecOps Application" \
+      security.cis-benchmark="docker-v1.6" \
+      security.data-classification="Sensitive" \
+      security.scan-status="trivy-clean"

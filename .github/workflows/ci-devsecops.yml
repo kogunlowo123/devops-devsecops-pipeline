@@ -1,0 +1,468 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, 'release/**', 'hotfix/**']
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Nightly full security scan
+    - cron: '0 2 * * *'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SONAR_PROJECT_KEY: devsecops-pipeline
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+  TF_VERSION: '1.7.0'
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write
+  pull-requests: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 1: Secret Detection & Pre-Flight Checks
+  # ─────────────────────────────────────────────────────────────────────────
+  secret-detection:
+    name: 🔐 Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: Run detect-secrets
+        run: |
+          pip install detect-secrets
+          detect-secrets scan --all-files --baseline .secrets.baseline || true
+          detect-secrets audit .secrets.baseline
+
+      - name: Check for hardcoded credentials
+        run: |
+          echo "Scanning for common credential patterns..."
+          if grep -rE "(password|passwd|pwd|secret|api_key|apikey|token)\s*=\s*['\"][^'\"]{8,}" \
+            --include="*.py" --include="*.js" --include="*.ts" --include="*.yaml" \
+            --exclude-dir=".git" --exclude-dir="node_modules" .; then
+            echo "::error::Potential hardcoded credentials found!"
+            exit 1
+          fi
+          echo "✅ No hardcoded credentials detected"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 2: Static Application Security Testing (SAST)
+  # ─────────────────────────────────────────────────────────────────────────
+  sast-scan:
+    name: 🔍 SAST Analysis
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.security.hotspots.inheritFromParent=true
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/hipaa
+          generateSarif: '1'
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Run Bandit (Python Security)
+        run: |
+          pip install bandit[toml]
+          bandit -r . -f json -o bandit-report.json \
+            --exclude ./.git,./node_modules,./venv \
+            -ll || true
+          python -c "
+          import json, sys
+          with open('bandit-report.json') as f:
+            report = json.load(f)
+          high_severity = [r for r in report.get('results', []) if r['issue_severity'] == 'HIGH']
+          if high_severity:
+            print(f'::error::Found {len(high_severity)} HIGH severity issues')
+            for issue in high_severity:
+              print(f'  - {issue[\"issue_text\"]} in {issue[\"filename\"]}:{issue[\"line_number\"]}')
+            sys.exit(1)
+          print('✅ No HIGH severity Bandit findings')
+          "
+
+      - name: Upload Bandit Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 3: Software Composition Analysis (SCA)
+  # ─────────────────────────────────────────────────────────────────────────
+  sca-scan:
+    name: 📦 Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Snyk for Python dependencies
+        uses: snyk/actions/python@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --fail-on=all
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'devsecops-pipeline'
+          path: '.'
+          format: 'ALL'
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+            --enableExperimental
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py -o sbom.json --schema-version 1.5
+          echo "✅ SBOM generated: sbom.json"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.json
+
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: ${{github.workspace}}/reports
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 4: Infrastructure as Code Security
+  # ─────────────────────────────────────────────────────────────────────────
+  iac-security:
+    name: 🏗️ IaC Security Scan
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: false
+          check: CKV_AWS_*,CKV_AZURE_*,CKV2_AWS_*
+          skip_check: CKV_AWS_144,CKV_AWS_145  # exceptions with justification
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/
+          format: sarif
+          sarif_file: tfsec-results.sarif
+          minimum_severity: HIGH
+
+      - name: Run Conftest OPA Policies
+        run: |
+          wget -O /usr/local/bin/conftest \
+            https://github.com/open-policy-agent/conftest/releases/download/v0.49.0/conftest_0.49.0_Linux_x86_64.tar.gz
+          chmod +x /usr/local/bin/conftest
+          conftest test terraform/ --policy policies/conftest/ --output=table
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 5: Build & Container Security
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-scan:
+    name: 🐳 Build & Container Security
+    runs-on: ubuntu-latest
+    needs: [sast-scan, sca-scan, iac-security]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-uri: ${{ steps.build.outputs.imageid }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+
+      - name: Run Dockle (Dockerfile lint)
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/goodwithtech/dockle/releases/latest | \
+            grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          curl -L -o dockle.deb \
+            "https://github.com/goodwithtech/dockle/releases/download/v${VERSION}/dockle_${VERSION}_Linux-64bit.deb"
+          sudo dpkg -i dockle.deb
+          dockle --exit-code 1 --exit-level fatal \
+            --ignore CIS-DI-0001 \
+            ./docker/Dockerfile || echo "Dockle check complete"
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            GIT_COMMIT=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Run Grype (secondary scanner)
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          fail-build: true
+          severity-cutoff: critical
+
+      - name: Push image (after scans pass)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign container image with Cosign
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 6: Deploy to Staging
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    environment:
+      name: staging
+      url: https://staging.app.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name staging-cluster --region us-east-1
+
+      - name: Deploy via ArgoCD
+        run: |
+          argocd app sync devsecops-staging \
+            --revision ${{ github.sha }} \
+            --prune \
+            --timeout 300
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/app -n staging --timeout=5m
+          echo "✅ Staging deployment complete"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 7: DAST (Dynamic Application Security Testing)
+  # ─────────────────────────────────────────────────────────────────────────
+  dast-scan:
+    name: 🕷️ DAST Scan
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.9.0
+        with:
+          target: 'https://staging.app.example.com'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -j'
+          fail_action: true
+
+      - name: Upload ZAP Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: report_html.html
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 8: Compliance Gate
+  # ─────────────────────────────────────────────────────────────────────────
+  compliance-gate:
+    name: ✅ Compliance Gate
+    runs-on: ubuntu-latest
+    needs: dast-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Run compliance aggregation
+        run: |
+          ./scripts/compliance-report.sh \
+            --framework NIST-800-53 \
+            --framework HIPAA \
+            --framework SOC2 \
+            --output compliance-report.json
+
+      - name: Post compliance summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('compliance-report.json', 'utf8'));
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🛡️ Security & Compliance Report\n\n${report.summary}`
+            });
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # STAGE 9: Production Deployment (Manual Gate)
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: compliance-gate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://app.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Production)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity ${{ github.server_url }}/${{ github.workflow_ref }} \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-scan.outputs.image-digest }}
+
+      - name: Deploy via ArgoCD (Production)
+        run: |
+          argocd app sync devsecops-production \
+            --revision ${{ github.sha }} \
+            --prune \
+            --timeout 600
+
+      - name: Notify on success
+        uses: 8398a7/action-slack@v3
+        if: success()
+        with:
+          status: success
+          text: '✅ Production deployment successful — ${{ github.sha }}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify on failure
+        uses: 8398a7/action-slack@v3
+        if: failure()
+        with:
+          status: failure
+          text: '🚨 Production deployment FAILED — ${{ github.sha }} — immediate attention required'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

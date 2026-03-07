@@ -1,0 +1,57 @@
+# Prometheus Alert Rules — Enterprise DevSecOps Pipeline
+# Architect: Kehinde (Kenny) Samson Ogunlowo
+groups:
+  - name: security_alerts
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 2m
+        labels: { severity: critical, team: security }
+        annotations:
+          summary: "High 5xx error rate: {{ $value | humanizePercentage }}"
+          runbook_url: "https://wiki.internal/runbooks/high-error-rate"
+
+      - alert: UnauthorizedAccessSpike
+        expr: rate(http_requests_total{status="401"}[5m]) > 10
+        for: 1m
+        labels: { severity: warning, compliance: hipaa }
+        annotations:
+          summary: "Unusual 401 spike — possible credential stuffing"
+
+      - alert: ContainerVulnerabilityDetected
+        expr: trivy_vulnerability_count{severity="CRITICAL"} > 0
+        for: 0m
+        labels: { severity: critical, compliance: cmmc }
+        annotations:
+          summary: "CRITICAL container vulnerability detected in {{ $labels.image }}"
+
+      - alert: SecretsLeakDetected
+        expr: gitleaks_secrets_found_total > 0
+        for: 0m
+        labels: { severity: critical, team: security }
+        annotations:
+          summary: "Secret/credential leaked in commit {{ $labels.commit }}"
+
+      - alert: ComplianceGateFailed
+        expr: devsecops_compliance_gate_result == 0
+        for: 0m
+        labels: { severity: critical, compliance: hipaa_cmmc }
+        annotations:
+          summary: "Compliance gate FAILED for deployment {{ $labels.environment }}"
+
+  - name: availability_alerts
+    rules:
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[15m]) * 60 * 15 > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash-looping"
+
+      - alert: DeploymentReplicasMismatch
+        expr: kube_deployment_status_replicas_available != kube_deployment_spec_replicas
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} has unavailable replicas"

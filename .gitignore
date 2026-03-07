@@ -1,0 +1,5 @@
+.terraform/ *.tfstate *.tfstate.backup *.tfplan *.tfvars !example.tfvars
+__pycache__/ .venv/ venv/ *.py[cod] .env .env.* !.env.example
+*.pem *.key *.cert secrets/ credentials/
+node_modules/ .DS_Store .idea/ .vscode/
+compliance-evidence.json sbom.json *-results.sarif

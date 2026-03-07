@@ -1,0 +1,45 @@
+{
+  "title": "Enterprise DevSecOps Security Dashboard",
+  "description": "Architect: Kehinde (Kenny) Samson Ogunlowo | Real-time pipeline security metrics",
+  "tags": ["devsecops", "security", "compliance", "hipaa", "cmmc"],
+  "timezone": "UTC",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "🔒 Compliance Gate Status",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "devsecops_compliance_gate_result", "legendFormat": "Gate Status" }],
+      "options": {
+        "colorMode": "background",
+        "thresholds": { "steps": [{ "value": 0, "color": "red" }, { "value": 1, "color": "green" }] }
+      }
+    },
+    {
+      "id": 2,
+      "title": "🛡️ Critical Vulnerabilities (Last 24h)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "trivy_vulnerability_count{severity='CRITICAL'}", "legendFormat": "CRITICAL" },
+        { "expr": "trivy_vulnerability_count{severity='HIGH'}", "legendFormat": "HIGH" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "🔑 Secret Scan Findings",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 4 },
+      "targets": [{ "expr": "sum(gitleaks_secrets_found_total)", "legendFormat": "Secrets Found" }]
+    },
+    {
+      "id": 4,
+      "title": "📊 Pipeline Stage Success Rate",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "rate(ci_pipeline_success_total[1h]) / rate(ci_pipeline_total[1h]) * 100" }],
+      "options": { "thresholds": { "steps": [{ "value": 0, "color": "red" }, { "value": 70, "color": "yellow" }, { "value": 90, "color": "green" }] } }
+    }
+  ]
+}
