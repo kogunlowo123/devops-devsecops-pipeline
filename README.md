@@ -144,3 +144,8 @@ devops-devsecops-pipeline/
 
 ## Author
 **Kehinde (Kenny) Ogunlowo** — [citadelcloudmanagement.com](https://citadelcloudmanagement.com) | kogunlowo@gmail.com | [LinkedIn](https://linkedin.com/in/kehinde-ogunlowo)
+
+<!-- architecture -->
+## Architecture
+
+![Architecture diagram](docs/architecture.svg)
